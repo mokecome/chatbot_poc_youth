@@ -1,49 +1,62 @@
-import { Button } from "./ui/button";
 import { Card } from "./ui/card";
-import { HOTEL_PRIMARY, HOTEL_PRIMARY_SOFT } from "../styles/hotelTheme";
 
 interface ChatFAQSectionProps {
   onQuestionClick: (question: string) => void;
 }
 
 export function ChatFAQSection({ onQuestionClick }: ChatFAQSectionProps) {
-  const faqButtons = [
+  const topicCards = [
     {
-      id: "room-availability",
-      label: "查詢房型與價格",
-      question: "我想了解豪華雙人房這週末是否還有空房？費用是多少？"
+      id: "ai-translation",
+      label: "AI 轉譯",
+      image: "/images/AI轉譯image.jpg",
+      question: "我想了解 AI 轉譯服務，可以幫助我做什麼？"
     },
     {
-      id: "dining-reservation",
-      label: "預約餐廳或酒吧",
-      question: "可以幫我預約明天晚上七點的水漾月明湖畔餐廳兩人晚餐嗎？"
+      id: "healing-space",
+      label: "痊癒空間",
+      image: "/images/痊癒空間image.jpg",
+      question: "請介紹一下痊癒空間的服務內容"
     },
     {
-      id: "late-checkout",
-      label: "延遲退房與接駁",
-      question: "請問如何申請延遲退房？飯店是否提供機場接送服務？"
+      id: "light-politics",
+      label: "輕參政",
+      image: "/images/輕參政image.jpg",
+      question: "什麼是輕參政？青年可以如何參與？"
+    },
+    {
+      id: "youth-exchange",
+      label: "青年交流",
+      image: "/images/青年在咖啡館交流image.jpg",
+      question: "有哪些青年交流的活動可以參加？"
     }
   ];
 
   return (
-    <Card
-      className="p-4 border"
-      style={{ backgroundColor: HOTEL_PRIMARY_SOFT, borderColor: `${HOTEL_PRIMARY}33` }}
-    >
+    <Card className="p-4 border bg-[#F8F6F3] border-[#E8E4DE]">
       <h4 className="text-[16px] font-medium mb-3 text-foreground select-text cursor-text">
-        熱門服務快速選單
+        熱門主題快速選單
       </h4>
-      <div className="flex flex-col gap-2">
-        {faqButtons.map((button) => (
-          <Button
-            key={button.id}
-            variant="outline"
-            size="sm"
-            className="w-full text-[13px] h-9 px-3 bg-white border border-[#E6D8C4] text-[#4A3A2A] hover:bg-[#B38844]/10 hover:border-[#B38844] hover:text-[#B38844] transition-colors text-center justify-center shadow-sm"
-            onClick={() => onQuestionClick(button.question)}
+      <div className="grid grid-cols-2 gap-3">
+        {topicCards.map((topic) => (
+          <button
+            key={topic.id}
+            className="group relative overflow-hidden rounded-lg border border-[#E8E4DE] bg-white hover:border-[#5B8C5A] hover:shadow-md transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-[#5B8C5A] focus:ring-offset-2"
+            onClick={() => onQuestionClick(topic.question)}
           >
-            <span className="select-text cursor-text">{button.label}</span>
-          </Button>
+            <div className="aspect-[4/3] overflow-hidden">
+              <img
+                src={topic.image}
+                alt={topic.label}
+                className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200"
+              />
+            </div>
+            <div className="p-2 text-center">
+              <span className="text-[13px] font-medium text-[#3A3A3A] group-hover:text-[#5B8C5A] select-text cursor-text">
+                {topic.label}
+              </span>
+            </div>
+          </button>
         ))}
       </div>
     </Card>
