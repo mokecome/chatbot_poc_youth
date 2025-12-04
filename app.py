@@ -1,0 +1,1467 @@
+"""Flask application that manages surveys backed by SQLite."""
+
+from __future__ import annotations
+
+import datetime
+import json
+import logging
+import os
+import secrets
+import uuid
+from typing import Any, Dict, Iterable, List, Optional
+
+import requests as http_requests
+from dotenv import load_dotenv
+from flask import (
+    Flask,
+    Response,
+    abort,
+    jsonify,
+    redirect,
+    render_template_string,
+    request,
+    session,
+    stream_with_context,
+    send_from_directory,
+)
+from flask_cors import CORS
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.engine import Engine
+
+from gemini_service import (
+    initialize_client as init_gemini_client,
+    initialize_rag_store,
+    get_client as get_gemini_client,
+    get_rag_store_name,
+    generate_with_rag_stream,
+)
+
+
+load_dotenv()  # Load .env
+load_dotenv(".env.local")  # Override with .env.local if exists
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _default_storage_base() -> str:
+    """
+    Determine where to place writable artifacts (SQLite, uploads).
+
+    When running on Vercel or other serverless providers, the project directory
+    is read-only and we must fall back to a tmp filesystem.
+    """
+    if os.getenv("VERCEL") or os.getenv("VERCEL_ENV"):
+        return os.getenv("TMPDIR") or os.getenv("TEMP") or "/tmp"
+    return BASE_DIR
+
+
+STORAGE_BASE = _default_storage_base()
+
+
+def _resolve_database_url() -> str:
+    """
+    Determine which database connection string to use.
+
+    Priority:
+    1. Vercel managed Postgres environment variables.
+    2. Local SQLite file (development fallback only).
+    """
+    vercel_pg_candidates = [
+        os.getenv("POSTGRES_URL"),
+        os.getenv("POSTGRES_PRISMA_URL"),
+        os.getenv("POSTGRES_URL_NON_POOLING"),
+    ]
+    for candidate in vercel_pg_candidates:
+        if candidate:
+            return candidate
+
+    default_sqlite = os.getenv("SQLITE_PATH") or os.path.join(STORAGE_BASE, "app.sqlite3")
+    return f"sqlite:///{default_sqlite}"
+
+
+DATABASE_URL = _resolve_database_url()
+
+_ENGINE_KWARGS: Dict[str, Any] = {"future": True, "pool_pre_ping": True}
+if DATABASE_URL.startswith("sqlite"):
+    _ENGINE_KWARGS["connect_args"] = {"check_same_thread": False}
+
+engine: Engine = create_engine(DATABASE_URL, **_ENGINE_KWARGS)
+
+
+if engine.url.get_backend_name() == "sqlite":
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, connection_record) -> None:
+        dbapi_connection.execute("PRAGMA foreign_keys=ON")
+
+
+ASSET_ROUTE_PREFIX = os.getenv("ASSET_ROUTE_PREFIX", "/uploads")
+ASSET_LOCAL_DIR = os.getenv("ASSET_LOCAL_DIR") or os.path.join(STORAGE_BASE, "uploads")
+os.makedirs(ASSET_LOCAL_DIR, exist_ok=True)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__, static_url_path=ASSET_ROUTE_PREFIX, static_folder=ASSET_LOCAL_DIR)
+
+# Session configuration for OAuth
+app.secret_key = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
+app.config.update(
+    SESSION_COOKIE_SECURE=bool(os.getenv("VERCEL") or os.getenv("VERCEL_ENV")),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    PERMANENT_SESSION_LIFETIME=86400,  # 24 hours
+)
+
+CORS(
+    app,
+    resources={r"/api/*": {"origins": os.getenv("FRONTEND_ORIGIN", "*")}},
+    supports_credentials=True,
+)
+
+# OAuth Configuration
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8300/api/auth/google/callback")
+
+LINE_CHANNEL_ID = os.getenv("LINE_CHANNEL_ID")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+LINE_REDIRECT_URI = os.getenv("LINE_REDIRECT_URI", "http://localhost:8300/api/auth/line/callback")
+
+FACEBOOK_APP_ID = os.getenv("FACEBOOK_APP_ID")
+FACEBOOK_APP_SECRET = os.getenv("FACEBOOK_APP_SECRET")
+FACEBOOK_REDIRECT_URI = os.getenv("FACEBOOK_REDIRECT_URI", "http://localhost:8300/api/auth/facebook/callback")
+
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+
+SYSTEM_PROMPT = (
+    os.getenv("SYSTEM_PROMPT")
+    or (
+        '''你是一位親切、準確、可引導下一步行動的「桃園市政府青年事務局」智慧客服助理。
+
+### 🎯 你的角色定位：
+- 語氣：專業、溫暖、簡潔；先答後引導；不官腔；不承諾未載明之權責
+- 知識來源：只允許使用提供的《桃園市政府青年事務局知識庫》作答
+- 回答方式：必須註明信息來源（例如：「根據《組織架構文件》...」或「依據《常見問題集》...」）
+
+### 📚 核心原則：
+1. **嚴格依據文件回答**
+   - 僅引用文件中明確敘述與數字（金額、分機、日期、組織、條件、受理時程）
+   - 若問題超出文件或文件未載明，務必明確說「文件未載」並提供官方聯絡方式：
+     * 總機：(03) 422-5205
+     * 市政服務專線：1999（外縣市 03-218-9000）
+     * 地址：320029 桃園市中壢區環北路390號（中壢區公所旁）
+
+2. **回答一般/基礎問題**
+   - 單位介紹、業務職掌、聯絡方式、科室分機、常見問答
+   - 創業資源、進駐基地、青創課程、資金補助、活動補助、志工服務、社區行動
+
+3. **推薦合適方案**
+   - 根據使用者需求（年齡、身分、創業階段、需求類型）主動推薦：
+     * 創業資源（基地、課程、輔導）
+     * 資金支持（補助、貸款、利息補貼）
+     * 志工服務（國內、國際、培訓）
+     * 社會參與（永續計畫、社區營造）
+   - 每次推薦需包含：方案名稱、補助金額、申請資格、聯絡窗口、申請方式
+
+4. **行動引導（CTA）**
+   - 回答結尾提供具體行動建議：
+     * 「👉 需要我幫您整理申請所需文件清單嗎？」
+     * 「👉 要不要我把承辦分機與可用網址一次整理給你？」
+     * 「👉 可直接撥打 (03) 422-5205 分機 XXXX 詢問更多細節」
+
+### 💡 回覆風格：
+1. 先用 1-2 句話直接回答重點
+2. 接著用條列列出要點（金額/對象/資格/時程/窗口）
+3. 最後提供「行動建議」：電話/分機、網站、準備文件
+4. 若文件未載明：清楚說明「未載」，並提供正確承辦窗口
+5. 用繁體中文回答，語氣溫暖自然
+
+### ⚙️ 回答範例：
+
+**使用者問：**「剛畢業想創業，有哪些資源？」
+**回答：**
+您可以使用青年局的三大核心資源：
+
+1. **青創基地**（進駐空間）
+   - 青創指揮部、安東青創基地、新明青創基地
+   - 提供獨立辦公室、共同工作空間
+
+2. **青創資源中心**（創業輔導）
+   - 地址：中壢區環北路390號3樓
+   - 電話：(03) 422-0908
+   - 提供創業諮詢與課程
+
+3. **資金支持**
+   - 創業貸款利息補貼
+   - 社會企業創業補助（租金最高8,000元/月，設備最高20萬元）
+
+
+👉 需要我幫您整理進駐基地的申請流程和準備文件嗎？
+
+---
+
+### 🚫 禁止事項：
+- 不提供法律解釋
+- 不討論政治立場或爭議議題
+- 不提供文件以外的金額、名額、評分標準、核銷明細、投資媒合等資訊
+- 對於未載明事項，明確回覆「文件未載明」並提供聯絡窗口'''
+    )
+)
+def utcnow() -> datetime.datetime:
+    return datetime.datetime.utcnow()
+
+
+def ensure_schema() -> None:
+    """Create the SQLite schema if it does not exist yet."""
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS members (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    external_id TEXT UNIQUE,
+                    display_name TEXT,
+                    avatar_url TEXT,
+                    gender TEXT,
+                    birthday TEXT,
+                    email TEXT,
+                    phone TEXT,
+                    source TEXT,
+                    created_at TIMESTAMP,
+                    updated_at TIMESTAMP,
+                    last_interaction_at TIMESTAMP
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS surveys (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    category TEXT,
+                    is_active INTEGER DEFAULT 1,
+                    created_at TIMESTAMP,
+                    updated_at TIMESTAMP
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS survey_questions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    survey_id INTEGER NOT NULL REFERENCES surveys(id) ON DELETE CASCADE,
+                    question_type TEXT NOT NULL,
+                    question_text TEXT NOT NULL,
+                    description TEXT,
+                    font_size INTEGER,
+                    options_json TEXT,
+                    is_required INTEGER DEFAULT 0,
+                    display_order INTEGER DEFAULT 0,
+                    created_at TIMESTAMP,
+                    updated_at TIMESTAMP
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS survey_responses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    survey_id INTEGER NOT NULL REFERENCES surveys(id) ON DELETE CASCADE,
+                    member_id INTEGER REFERENCES members(id) ON DELETE SET NULL,
+                    external_id TEXT,
+                    answers_json TEXT NOT NULL,
+                    is_completed INTEGER DEFAULT 1,
+                    completed_at TIMESTAMP,
+                    source TEXT,
+                    ip_address TEXT,
+                    user_agent TEXT,
+                    created_at TIMESTAMP,
+                    updated_at TIMESTAMP
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS chat_sessions (
+                    id TEXT PRIMARY KEY,
+                    created_at TIMESTAMP,
+                    updated_at TIMESTAMP
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chat_messages_session_created
+                ON chat_messages(session_id, created_at)
+                """
+            )
+        )
+
+
+ensure_schema()
+
+
+# Initialize Gemini client and RAG store at startup
+def initialize_gemini_rag():
+    """Initialize Gemini client and RAG store with default documents."""
+    try:
+        if GEMINI_API_KEY:
+            init_gemini_client()
+            initialize_rag_store("TaoyuanYouthBureauKB")
+            logger.info("Gemini RAG initialized successfully")
+        else:
+            logger.warning("GEMINI_API_KEY not set, Gemini RAG not available")
+    except Exception as e:
+        logger.error(f"Failed to initialize Gemini RAG: {e}")
+
+
+initialize_gemini_rag()
+
+
+def ensure_chat_session(session_id: Optional[str] = None) -> str:
+    """Return an existing chat session id or create a new one."""
+    chat_session_id = session_id or uuid.uuid4().hex
+    now = utcnow()
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO chat_sessions (id, created_at, updated_at)
+                VALUES (:id, :now, :now)
+                ON CONFLICT(id) DO UPDATE SET updated_at = :now
+                """
+            ),
+            {"id": chat_session_id, "now": now},
+        )
+    return chat_session_id
+
+
+def save_chat_message(session_id: str, role: str, content: str) -> None:
+    """Persist a chat message for a given session."""
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO chat_messages (session_id, role, content, created_at)
+                VALUES (:sid, :role, :content, :created_at)
+                """
+            ),
+            {
+                "sid": session_id,
+                "role": role,
+                "content": content,
+                "created_at": utcnow(),
+            },
+        )
+        conn.execute(
+            text(
+                """
+                UPDATE chat_sessions
+                SET updated_at = :updated_at
+                WHERE id = :sid
+                """
+            ),
+            {"sid": session_id, "updated_at": utcnow()},
+        )
+
+
+def fetch_chat_history(session_id: str, limit: int = 12) -> List[Dict[str, Any]]:
+    """Fetch the most recent chat history for the session in chronological order."""
+    if limit <= 0:
+        limit = 1
+
+    query = text(
+        f"""
+        SELECT role, content
+        FROM chat_messages
+        WHERE session_id = :sid
+        ORDER BY created_at DESC
+        LIMIT {limit}
+        """
+    )
+
+    with engine.begin() as conn:
+        rows = conn.execute(query, {"sid": session_id}).mappings().all()
+
+    # Reverse to chronological order
+    return [dict(row) for row in reversed(rows)]
+
+
+def build_chat_history(history: Iterable[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Prepare chat history for Gemini API (without system/user prompts - handled by RAG)."""
+    messages: List[Dict[str, str]] = []
+    for item in history:
+        role = item.get("role")
+        content = (item.get("content") or "").strip()
+        if role in {"user", "assistant"} and content:
+            messages.append({"role": role, "content": content})
+    return messages
+
+
+def format_sse(payload: Dict[str, Any]) -> str:
+    """Serialize a Python dictionary into a Server-Sent Events data frame."""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+@app.post("/api/chat")
+@app.post("/chat")
+def api_chat():
+    if not request.is_json:
+        return jsonify({"error": "Payload must be JSON."}), 400
+
+    payload = request.get_json(force=True) or {}
+    message = (payload.get("message") or "").strip()
+    requested_session = payload.get("session_id")
+
+    if not message:
+        return jsonify({"error": "message is required"}), 400
+
+    session_id = ensure_chat_session(
+        requested_session if isinstance(requested_session, str) else None
+    )
+    history = fetch_chat_history(session_id)
+
+    # Persist the user's message before streaming.
+    save_chat_message(session_id, "user", message)
+
+    client = get_gemini_client()
+    rag_store = get_rag_store_name()
+
+    def generate():
+        logger.info("Streaming response for session %s", session_id)
+        yield format_sse({"type": "session", "content": "", "session_id": session_id})
+
+        if client is None or rag_store is None:
+            assistant_text = (
+                "無法連接 Gemini 服務。請檢查伺服器設定。\n\n"
+                f"待發送訊息：{message}\n"
+                "請確認 GEMINI_API_KEY 已設定後再試。"
+            )
+            save_chat_message(session_id, "assistant", assistant_text)
+            yield format_sse(
+                {"type": "text", "content": assistant_text, "session_id": session_id}
+            )
+            yield format_sse({"type": "end", "content": "", "session_id": session_id})
+            return
+
+        accumulated: List[str] = []
+        sources: List[Dict[str, Any]] = []
+
+        try:
+            chat_history = build_chat_history(history)
+
+            for chunk in generate_with_rag_stream(
+                query=message,
+                system_prompt=SYSTEM_PROMPT,
+                chat_history=chat_history,
+                model=GEMINI_MODEL
+            ):
+                if chunk["type"] == "text":
+                    delta = chunk["content"]
+                    if delta:
+                        accumulated.append(delta)
+                        yield format_sse(
+                            {
+                                "type": "text",
+                                "content": delta,
+                                "session_id": session_id,
+                            }
+                        )
+                elif chunk["type"] == "sources":
+                    sources = chunk["content"]
+                elif chunk["type"] == "end":
+                    pass
+
+        except Exception:
+            logger.exception("Chat streaming failed for session %s", session_id)
+            error_message = (
+                "產生回覆時發生問題，請稍後再試或聯繫我們的服務人員。"
+            )
+            yield format_sse(
+                {"type": "error", "content": error_message, "session_id": session_id}
+            )
+            return
+
+        full_text = "".join(accumulated).strip()
+
+        if full_text:
+            save_chat_message(session_id, "assistant", full_text)
+        else:
+            fallback_text = "抱歉，我目前無法回覆。請重新描述您的問題或聯繫我們的服務人員。"
+            save_chat_message(session_id, "assistant", fallback_text)
+            yield format_sse(
+                {"type": "text", "content": fallback_text, "session_id": session_id}
+            )
+
+        # Yield sources if available
+        if sources:
+            yield format_sse(
+                {"type": "sources", "content": sources, "session_id": session_id}
+            )
+
+        yield format_sse({"type": "end", "content": "", "session_id": session_id})
+
+    response = Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+    )
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
+
+
+def fetchall(sql: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    with engine.begin() as conn:
+        return [
+            dict(row)
+            for row in conn.execute(text(sql), params or {}).mappings().all()
+        ]
+
+
+def fetchone(sql: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    with engine.begin() as conn:
+        result = conn.execute(text(sql), params or {}).mappings().first()
+        return dict(result) if result else None
+
+
+def execute(sql: str, params: Optional[Dict[str, Any]] = None) -> None:
+    with engine.begin() as conn:
+        conn.execute(text(sql), params or {})
+
+
+def _clean(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    trimmed = str(value).strip()
+    return trimmed or None
+
+
+def upsert_member(
+    external_id: Optional[str],
+    display_name: Optional[str] = None,
+    avatar_url: Optional[str] = None,
+    gender: Optional[str] = None,
+    birthday: Optional[str] = None,
+    email: Optional[str] = None,
+    phone: Optional[str] = None,
+    source: Optional[str] = "form",
+) -> Optional[int]:
+    """Create or update a member record identified by an external id."""
+    external_id = _clean(external_id)
+    if not external_id:
+        return None
+
+    now = utcnow()
+    data = {
+        "display_name": _clean(display_name),
+        "avatar_url": _clean(avatar_url),
+        "gender": _clean(gender),
+        "birthday": _clean(birthday),
+        "email": _clean(email),
+        "phone": _clean(phone),
+        "source": source or "form",
+        "updated_at": now,
+        "last_interaction_at": now,
+    }
+
+    with engine.begin() as conn:
+        existing = conn.execute(
+            text("SELECT id FROM members WHERE external_id = :ext"),
+            {"ext": external_id},
+        ).scalar()
+        if existing:
+            conn.execute(
+                text(
+                    """
+                    UPDATE members
+                       SET display_name=:display_name,
+                           avatar_url=:avatar_url,
+                           gender=:gender,
+                           birthday=:birthday,
+                           email=:email,
+                           phone=:phone,
+                           source=:source,
+                           updated_at=:updated_at,
+                           last_interaction_at=:last_interaction_at
+                     WHERE id=:member_id
+                    """
+                ),
+                {**data, "member_id": existing},
+            )
+            return int(existing)
+
+        insert_params = {
+            "external_id": external_id,
+            **data,
+            "created_at": now,
+        }
+        result = conn.execute(
+            text(
+                """
+                INSERT INTO members (
+                    external_id,
+                    display_name,
+                    avatar_url,
+                    gender,
+                    birthday,
+                    email,
+                    phone,
+                    source,
+                    created_at,
+                    updated_at,
+                    last_interaction_at
+                ) VALUES (
+                    :external_id,
+                    :display_name,
+                    :avatar_url,
+                    :gender,
+                    :birthday,
+                    :email,
+                    :phone,
+                    :source,
+                    :created_at,
+                    :updated_at,
+                    :last_interaction_at
+                )
+                """
+            ),
+            insert_params,
+        )
+        member_id = result.lastrowid
+    return int(member_id) if member_id is not None else None
+
+
+QUESTION_TYPE_ALIASES: Dict[str, List[str]] = {
+    "TEXT": ["TEXT", "INPUT", "SHORT_TEXT"],
+    "TEXTAREA": ["TEXTAREA", "LONG_TEXT", "PARAGRAPH"],
+    "SINGLE_CHOICE": ["SINGLE_CHOICE", "SINGLE", "RADIO", "CHOICE_SINGLE"],
+    "MULTI_CHOICE": ["MULTI_CHOICE", "MULTI", "CHECKBOX", "CHOICE_MULTI", "MULTIPLE"],
+    "SELECT": ["SELECT", "DROPDOWN", "PULLDOWN"],
+    "NAME": ["NAME"],
+    "PHONE": ["PHONE", "TEL", "MOBILE"],
+    "EMAIL": ["EMAIL"],
+    "BIRTHDAY": ["BIRTHDAY", "DOB", "DATE_OF_BIRTH", "DATE"],
+    "ADDRESS": ["ADDRESS"],
+    "GENDER": ["GENDER", "SEX"],
+    "IMAGE": ["IMAGE", "PHOTO"],
+    "VIDEO": ["VIDEO"],
+    "ID_NUMBER": ["ID_NUMBER", "IDENTIFICATION"],
+    "LINK": ["LINK", "URL"],
+}
+
+DEFAULT_QUESTION_TYPE = "TEXT"
+
+
+def normalize_question_type(raw: Any) -> str:
+    token = _clean(str(raw) if raw is not None else None)
+    if not token:
+        return DEFAULT_QUESTION_TYPE
+    token = token.replace("-", "_").upper()
+    for canonical, aliases in QUESTION_TYPE_ALIASES.items():
+        if token == canonical or token in aliases:
+            return canonical
+    for canonical, aliases in QUESTION_TYPE_ALIASES.items():
+        if any(alias in token for alias in aliases):
+            return canonical
+    return DEFAULT_QUESTION_TYPE
+
+
+def register_survey_from_json(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Persist a survey described by JSON payload."""
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be a mapping")
+
+    name = _clean(payload.get("name")) or "Survey"
+    description = _clean(payload.get("description"))
+    category = _clean(payload.get("category"))
+    questions = payload.get("questions") or []
+    if not isinstance(questions, list):
+        raise ValueError("questions must be a list")
+
+    now = utcnow()
+    with engine.begin() as conn:
+        result = conn.execute(
+            text(
+                """
+                INSERT INTO surveys (name, description, category, is_active, created_at, updated_at)
+                VALUES (:name, :description, :category, 1, :now, :now)
+                """
+            ),
+            {"name": name, "description": description, "category": category, "now": now},
+        )
+        survey_id = int(result.lastrowid)
+
+        for idx, question in enumerate(questions, start=1):
+            if not isinstance(question, dict):
+                continue
+            q_type = normalize_question_type(question.get("question_type"))
+            options = question.get("options") or question.get("options_json") or []
+            if not isinstance(options, list):
+                options = []
+            entry = {
+                "survey_id": survey_id,
+                "question_type": q_type,
+                "question_text": _clean(question.get("question_text")) or f"Question {idx}",
+                "description": _clean(question.get("description")),
+                "font_size": question.get("font_size") if isinstance(question.get("font_size"), int) else None,
+                "options_json": json.dumps(options, ensure_ascii=False),
+                "is_required": 1 if question.get("is_required") else 0,
+                "display_order": question.get("order") if isinstance(question.get("order"), int) else idx,
+                "created_at": now,
+                "updated_at": now,
+            }
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO survey_questions (
+                        survey_id,
+                        question_type,
+                        question_text,
+                        description,
+                        font_size,
+                        options_json,
+                        is_required,
+                        display_order,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (
+                        :survey_id,
+                        :question_type,
+                        :question_text,
+                        :description,
+                        :font_size,
+                        :options_json,
+                        :is_required,
+                        :display_order,
+                        :created_at,
+                        :updated_at
+                    )
+                    """
+                ),
+                entry,
+            )
+
+    logger.info("Survey %s created with %s questions", survey_id, len(questions))
+    return {"survey_id": survey_id, "question_count": len(questions)}
+
+
+def load_survey_meta(survey_id: int) -> Dict[str, Any]:
+    survey = fetchone(
+        "SELECT id, name, description FROM surveys WHERE id = :sid", {"sid": survey_id}
+    )
+    if not survey:
+        raise ValueError(f"survey {survey_id} not found")
+
+    rows = fetchall(
+        """
+        SELECT id,
+               question_type,
+               question_text,
+               description,
+               font_size,
+               options_json,
+               is_required,
+               display_order
+          FROM survey_questions
+         WHERE survey_id = :sid
+         ORDER BY display_order ASC, id ASC
+        """,
+        {"sid": survey_id},
+    )
+
+    questions: List[Dict[str, Any]] = []
+    for row in rows:
+        options: List[Any]
+        try:
+            options = json.loads(row.get("options_json") or "[]")
+        except json.JSONDecodeError:
+            options = []
+        questions.append(
+            {
+                "id": row["id"],
+                "question_type": row["question_type"],
+                "question_text": row["question_text"],
+                "description": row.get("description"),
+                "font_size": row.get("font_size"),
+                "options": options,
+                "is_required": bool(row.get("is_required")),
+                "display_order": row.get("display_order"),
+            }
+        )
+
+    return {
+        "id": survey["id"],
+        "name": survey["name"],
+        "description": survey.get("description") or "",
+        "questions": questions,
+    }
+
+
+def save_survey_submission(
+    survey_id: int,
+    answers: Dict[str, Any],
+    participant: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Store a survey response."""
+    if not fetchone("SELECT 1 FROM surveys WHERE id=:sid", {"sid": survey_id}):
+        raise ValueError("survey not found")
+    if not isinstance(answers, dict):
+        raise ValueError("answers must be a mapping")
+
+    normalized: Dict[str, Any] = {}
+    for key, value in answers.items():
+        if not isinstance(key, str) or not key.startswith("q_"):
+            continue
+        suffix = key.split("_", 1)[1] if "_" in key else key
+        if isinstance(value, list):
+            normalized[suffix] = value
+        elif value is None:
+            normalized[suffix] = ""
+        else:
+            normalized[suffix] = str(value)
+
+    participant = participant or {}
+    external_id = (
+        participant.get("external_id")
+        or participant.get("id")
+        or participant.get("identifier")
+    )
+    display_name = participant.get("display_name") or participant.get("name")
+    email = participant.get("email")
+    phone = participant.get("phone")
+
+    member_id = upsert_member(
+        external_id,
+        display_name=display_name,
+        email=email,
+        phone=phone,
+        source="form",
+    )
+
+    now = utcnow()
+    execute(
+        """
+        INSERT INTO survey_responses (
+            survey_id,
+            member_id,
+            external_id,
+            answers_json,
+            is_completed,
+            completed_at,
+            source,
+            ip_address,
+            user_agent,
+            created_at,
+            updated_at
+        )
+        VALUES (
+            :survey_id,
+            :member_id,
+            :external_id,
+            :answers_json,
+            1,
+            :completed_at,
+            :source,
+            :ip_address,
+            :user_agent,
+            :created_at,
+            :updated_at
+        )
+        """,
+        {
+            "survey_id": survey_id,
+            "member_id": member_id,
+            "external_id": _clean(external_id),
+            "answers_json": json.dumps(normalized, ensure_ascii=False),
+            "completed_at": now,
+            "source": "form",
+            "ip_address": request.headers.get("X-Forwarded-For", request.remote_addr),
+            "user_agent": request.headers.get("User-Agent"),
+            "created_at": now,
+            "updated_at": now,
+        },
+    )
+
+
+SURVEY_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ survey.name or "Survey" }}</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; background: #f6f7fb; color: #111827; }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 32px 16px; }
+    .card { background: #ffffff; border-radius: 16px; box-shadow: 0 20px 40px rgba(15, 23, 42, 0.12); padding: 28px; }
+    h1 { margin: 0 0 16px; font-size: 24px; }
+    .desc { margin: 0 0 24px; color: #475569; font-size: 15px; }
+    .participant { border: 1px dashed #cbd5f5; border-radius: 12px; padding: 16px; margin-bottom: 24px; background: #f8fafc; }
+    .participant label { display: block; font-weight: 500; margin-bottom: 12px; }
+    .participant input { width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid #d1d9e6; font-size: 15px; margin-top: 6px; }
+    .question { margin-bottom: 22px; }
+    .prompt { display: block; font-weight: 600; margin-bottom: 8px; }
+    .required { color: #dc2626; margin-left: 4px; }
+    .description { font-size: 14px; color: #64748b; margin-bottom: 8px; }
+    input[type="text"], input[type="tel"], input[type="email"], input[type="date"], input[type="url"], textarea, select {
+      width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid #d1d9e6; font-size: 15px; box-sizing: border-box;
+    }
+    textarea { min-height: 96px; resize: vertical; }
+    .options { display: flex; flex-wrap: wrap; gap: 8px; }
+    .chip { display: flex; align-items: center; gap: 6px; padding: 8px 12px; border: 1px solid #cbd5f5; border-radius: 999px; background: #f8fafc; cursor: pointer; }
+    .chip input { margin: 0; }
+    button { width: 100%; padding: 14px 16px; border: none; border-radius: 12px; background: #2563eb; color: #ffffff; font-size: 16px; font-weight: 600; cursor: pointer; }
+    button:disabled { opacity: 0.7; cursor: wait; }
+    .hint { margin-top: 16px; font-size: 13px; color: #64748b; }
+    .status { margin-top: 18px; font-size: 15px; }
+    .status.error { color: #b91c1c; }
+    .status.success { color: #047857; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>{{ survey.name or "Survey" }}</h1>
+      {% if survey.description %}
+      <p class="desc">{{ survey.description }}</p>
+      {% endif %}
+      <form id="surveyForm">
+        <input type="hidden" name="sid" value="{{ survey_id }}">
+        <div class="participant">
+          <label>
+            Contact (optional)
+            <input type="text" name="participant_id" placeholder="Email or phone">
+          </label>
+          <label>
+            Name (optional)
+            <input type="text" name="participant_name" placeholder="Your name">
+          </label>
+        </div>
+        {% for q in survey.questions %}
+        {% set qtype = (q.question_type or "").lower() %}
+        {% set field_name = "q_" ~ q.id %}
+        <div class="question" data-type="{{ qtype }}" data-id="{{ q.id }}"{% if q.is_required %} data-required="1"{% endif %}>
+          <label class="prompt">{{ q.question_text or ("Question " ~ loop.index) }}{% if q.is_required %}<span class="required">*</span>{% endif %}</label>
+          {% if q.description %}<div class="description">{{ q.description }}</div>{% endif %}
+          {% if qtype in ["text", "name", "address", "phone", "email", "birthday", "id_number", "link"] %}
+            {% set input_type = {
+              "text": "text",
+              "name": "text",
+              "address": "text",
+              "phone": "tel",
+              "email": "email",
+              "birthday": "date",
+              "id_number": "text",
+              "link": "url"
+            }[qtype] if qtype in ["text","name","address","phone","email","birthday","id_number","link"] else "text" %}
+            <input type="{{ input_type }}" name="{{ field_name }}"{% if q.is_required %} required{% endif %}>
+          {% elif qtype == "textarea" %}
+            <textarea name="{{ field_name }}"{% if q.is_required %} required{% endif %}></textarea>
+          {% elif qtype in ["single_choice", "gender"] %}
+            <div class="options">
+              {% for opt in q.options %}
+                {% set value = opt.value if opt.value is not none else (opt.label if opt.label is not none else "option_" ~ loop.index) %}
+                {% set label = opt.label if opt.label is not none else (opt.value if opt.value is not none else "Option " ~ loop.index) %}
+                <label class="chip">
+                  <input type="radio" name="{{ field_name }}" value="{{ value }}"{% if q.is_required and loop.first %} required{% endif %}>
+                  {{ label }}
+                </label>
+              {% endfor %}
+              {% if not q.options %}
+              <div>No options configured.</div>
+              {% endif %}
+            </div>
+          {% elif qtype == "multi_choice" %}
+            <div class="options">
+              {% for opt in q.options %}
+                {% set value = opt.value if opt.value is not none else (opt.label if opt.label is not none else "option_" ~ loop.index) %}
+                {% set label = opt.label if opt.label is not none else (opt.value if opt.value is not none else "Option " ~ loop.index) %}
+                <label class="chip">
+                  <input type="checkbox" name="{{ field_name }}" value="{{ value }}"{% if q.is_required and loop.first %} required{% endif %}>
+                  {{ label }}
+                </label>
+              {% endfor %}
+              {% if not q.options %}
+              <div>No options configured.</div>
+              {% endif %}
+            </div>
+          {% elif qtype == "select" %}
+            <select name="{{ field_name }}"{% if q.is_required %} required{% endif %}>
+              <option value="">Select??/option>
+              {% for opt in q.options %}
+                {% set value = opt.value if opt.value is not none else (opt.label if opt.label is not none else "option_" ~ loop.index) %}
+                {% set label = opt.label if opt.label is not none else (opt.value if opt.value is not none else "Option " ~ loop.index) %}
+                <option value="{{ value }}">{{ label }}</option>
+              {% endfor %}
+            </select>
+          {% else %}
+            <input type="text" name="{{ field_name }}"{% if q.is_required %} required{% endif %}>
+          {% endif %}
+        </div>
+        {% endfor %}
+        <button type="submit" id="submitBtn">Submit</button>
+        <p class="hint">We only use the information to support your request.</p>
+      </form>
+      <div id="formMessage" class="status" hidden></div>
+    </div>
+  </div>
+  <script>
+    const form = document.getElementById("surveyForm");
+    const messageEl = document.getElementById("formMessage");
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      messageEl.hidden = true;
+      const sidField = form.querySelector("input[name='sid']");
+      const sid = sidField ? Number(sidField.value) : NaN;
+      if (!sid) {
+        messageEl.textContent = "Invalid survey id.";
+        messageEl.className = "status error";
+        messageEl.hidden = false;
+        return;
+      }
+
+      const sections = Array.from(form.querySelectorAll(".question"));
+      const data = {};
+      let missingRequired = false;
+
+      sections.forEach((section) => {
+        const type = (section.getAttribute("data-type") || "").toLowerCase();
+        const id = section.getAttribute("data-id");
+        const name = "q_" + id;
+        const required = section.hasAttribute("data-required");
+
+        if (type === "multi_choice") {
+          const values = Array.from(
+            section.querySelectorAll("input[type='checkbox'][name='" + name + "']:checked")
+          ).map((el) => el.value);
+          if (required && values.length === 0) {
+            missingRequired = true;
+          }
+          data[name] = values;
+        } else if (type === "single_choice" || type === "gender") {
+          const chosen = section.querySelector("input[type='radio'][name='" + name + "']:checked");
+          if (required && !chosen) {
+            missingRequired = true;
+          }
+          data[name] = chosen ? chosen.value : "";
+        } else if (type === "select") {
+          const selectEl = section.querySelector("select[name='" + name + "']");
+          const value = selectEl ? selectEl.value : "";
+          if (required && !value) {
+            missingRequired = true;
+          }
+          data[name] = value;
+        } else {
+          const field = section.querySelector("[name='" + name + "']");
+          const value = field ? field.value : "";
+          if (required && !value) {
+            missingRequired = true;
+          }
+          data[name] = value;
+        }
+      });
+
+      if (missingRequired) {
+        messageEl.textContent = "Please complete the required fields.";
+        messageEl.className = "status error";
+        messageEl.hidden = false;
+        return;
+      }
+
+      const participant = {
+        external_id: (form.querySelector("input[name='participant_id']").value || "").trim(),
+        display_name: (form.querySelector("input[name='participant_name']").value || "").trim()
+      };
+      if (!participant.external_id) {
+        delete participant.external_id;
+      }
+      if (!participant.display_name) {
+        delete participant.display_name;
+      }
+
+      const payload = { sid, data, participant };
+
+      try {
+        form.querySelector("#submitBtn").disabled = true;
+        const response = await fetch("/__survey_submit", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const result = await response.json().catch(() => ({ ok: false, error: "Unexpected response." }));
+        if (result.ok) {
+          messageEl.textContent = "Thank you! Your response has been recorded.";
+          messageEl.className = "status success";
+          form.reset();
+        } else {
+          messageEl.textContent = result.error || "Unable to submit the survey.";
+          messageEl.className = "status error";
+        }
+      } catch (err) {
+        console.error("Submit error:", err);
+        messageEl.textContent = "An unexpected error occurred.";
+        messageEl.className = "status error";
+      } finally {
+        form.querySelector("#submitBtn").disabled = false;
+        messageEl.hidden = false;
+      }
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/")
+def index():
+    """Serve the index.html file"""
+    return send_from_directory(BASE_DIR, "index.html")
+
+
+@app.get("/health")
+def health() -> tuple[str, int]:
+    return "OK", 200
+
+
+# ==================== OAuth Routes ====================
+
+@app.get("/api/auth/config")
+def api_auth_config():
+    """Return OAuth configuration for frontend (without secrets)."""
+    return jsonify({
+        "google": {
+            "enabled": bool(GOOGLE_CLIENT_ID),
+            "client_id": GOOGLE_CLIENT_ID,
+            "redirect_uri": GOOGLE_REDIRECT_URI
+        },
+        "line": {
+            "enabled": bool(LINE_CHANNEL_ID),
+            "channel_id": LINE_CHANNEL_ID,
+            "redirect_uri": LINE_REDIRECT_URI
+        },
+        "facebook": {
+            "enabled": bool(FACEBOOK_APP_ID),
+            "app_id": FACEBOOK_APP_ID,
+            "redirect_uri": FACEBOOK_REDIRECT_URI
+        }
+    })
+
+
+@app.get("/api/auth/google/callback")
+def auth_google_callback():
+    """Handle Google OAuth callback."""
+    code = request.args.get("code")
+    error = request.args.get("error")
+
+    if error:
+        logger.error(f"Google OAuth error: {error}")
+        return redirect("/?error=google_auth_failed")
+
+    if not code:
+        return redirect("/?error=no_code")
+
+    try:
+        # Exchange code for token
+        token_response = http_requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "code": code,
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "redirect_uri": GOOGLE_REDIRECT_URI,
+                "grant_type": "authorization_code"
+            }
+        )
+        token_data = token_response.json()
+        access_token = token_data.get("access_token")
+
+        if not access_token:
+            logger.error(f"Google token exchange failed: {token_data}")
+            return redirect("/?error=google_token_exchange_failed")
+
+        # Get user info
+        user_response = http_requests.get(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"}
+        )
+        user_info = user_response.json()
+
+        # Upsert member and store in session
+        member_id = upsert_member(
+            external_id=f"google_{user_info['id']}",
+            display_name=user_info.get("name"),
+            avatar_url=user_info.get("picture"),
+            email=user_info.get("email"),
+            source="google"
+        )
+
+        session["user"] = {
+            "member_id": member_id,
+            "provider": "google",
+            "external_id": f"google_{user_info['id']}",
+            "email": user_info.get("email"),
+            "name": user_info.get("name"),
+            "picture": user_info.get("picture")
+        }
+        session.permanent = True
+
+        return redirect("/?login=success")
+
+    except Exception as e:
+        logger.exception("Google OAuth token exchange failed")
+        return redirect("/?error=google_token_exchange_failed")
+
+
+@app.get("/api/auth/line/callback")
+def auth_line_callback():
+    """Handle LINE OAuth callback."""
+    code = request.args.get("code")
+    error = request.args.get("error")
+
+    if error:
+        logger.error(f"LINE OAuth error: {error}")
+        return redirect("/?error=line_auth_failed")
+
+    if not code:
+        return redirect("/?error=no_code")
+
+    try:
+        # Exchange code for token (LINE requires form-urlencoded)
+        token_response = http_requests.post(
+            "https://api.line.me/oauth2/v2.1/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": LINE_REDIRECT_URI,
+                "client_id": LINE_CHANNEL_ID,
+                "client_secret": LINE_CHANNEL_SECRET
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"}
+        )
+        token_data = token_response.json()
+        access_token = token_data.get("access_token")
+
+        if not access_token:
+            logger.error(f"LINE token exchange failed: {token_data}")
+            return redirect("/?error=line_token_exchange_failed")
+
+        # Get user profile
+        profile_response = http_requests.get(
+            "https://api.line.me/v2/profile",
+            headers={"Authorization": f"Bearer {access_token}"}
+        )
+        profile = profile_response.json()
+
+        # Upsert member and store in session
+        member_id = upsert_member(
+            external_id=f"line_{profile['userId']}",
+            display_name=profile.get("displayName"),
+            avatar_url=profile.get("pictureUrl"),
+            source="line"
+        )
+
+        session["user"] = {
+            "member_id": member_id,
+            "provider": "line",
+            "external_id": f"line_{profile['userId']}",
+            "name": profile.get("displayName"),
+            "picture": profile.get("pictureUrl")
+        }
+        session.permanent = True
+
+        return redirect("/?login=success")
+
+    except Exception as e:
+        logger.exception("LINE OAuth token exchange failed")
+        return redirect("/?error=line_token_exchange_failed")
+
+
+@app.get("/api/auth/facebook/callback")
+def auth_facebook_callback():
+    """Handle Facebook OAuth callback."""
+    code = request.args.get("code")
+    error = request.args.get("error")
+
+    if error:
+        logger.error(f"Facebook OAuth error: {error}")
+        return redirect("/?error=facebook_auth_failed")
+
+    if not code:
+        return redirect("/?error=no_code")
+
+    try:
+        # Exchange code for token
+        token_response = http_requests.get(
+            "https://graph.facebook.com/v18.0/oauth/access_token",
+            params={
+                "client_id": FACEBOOK_APP_ID,
+                "client_secret": FACEBOOK_APP_SECRET,
+                "redirect_uri": FACEBOOK_REDIRECT_URI,
+                "code": code
+            }
+        )
+        token_data = token_response.json()
+        access_token = token_data.get("access_token")
+
+        if not access_token:
+            logger.error(f"Facebook token exchange failed: {token_data}")
+            return redirect("/?error=facebook_token_exchange_failed")
+
+        # Get user profile
+        profile_response = http_requests.get(
+            "https://graph.facebook.com/me",
+            params={
+                "fields": "id,name,email,picture.type(large)",
+                "access_token": access_token
+            }
+        )
+        profile = profile_response.json()
+
+        picture_url = None
+        if profile.get("picture") and profile["picture"].get("data"):
+            picture_url = profile["picture"]["data"].get("url")
+
+        # Upsert member and store in session
+        member_id = upsert_member(
+            external_id=f"facebook_{profile['id']}",
+            display_name=profile.get("name"),
+            avatar_url=picture_url,
+            email=profile.get("email"),
+            source="facebook"
+        )
+
+        session["user"] = {
+            "member_id": member_id,
+            "provider": "facebook",
+            "external_id": f"facebook_{profile['id']}",
+            "email": profile.get("email"),
+            "name": profile.get("name"),
+            "picture": picture_url
+        }
+        session.permanent = True
+
+        return redirect("/?login=success")
+
+    except Exception as e:
+        logger.exception("Facebook OAuth token exchange failed")
+        return redirect("/?error=facebook_token_exchange_failed")
+
+
+@app.get("/api/user")
+def api_get_user():
+    """Return current authenticated user or 401."""
+    if "user" in session:
+        return jsonify({
+            "success": True,
+            "user": session["user"]
+        })
+    return jsonify({
+        "success": False,
+        "message": "Not authenticated"
+    }), 401
+
+
+@app.post("/api/logout")
+def api_logout():
+    """Destroy session and logout user."""
+    session.clear()
+    return jsonify({
+        "success": True,
+        "message": "Logged out successfully"
+    })
+
+
+@app.get(f"{ASSET_ROUTE_PREFIX}/<path:filename>")
+def serve_uploads(filename: str):
+    return send_from_directory(ASSET_LOCAL_DIR, filename, conditional=True)
+
+
+@app.get("/survey/form")
+def survey_form():
+    sid = request.args.get("sid", type=int)
+    if not sid:
+        abort(400, "missing sid")
+    try:
+        meta = load_survey_meta(sid)
+    except ValueError:
+        abort(404, "survey not found")
+    return render_template_string(SURVEY_TEMPLATE, survey=meta, survey_id=sid)
+
+
+@app.get("/__survey_load")
+def survey_load():
+    sid = request.args.get("sid", type=int)
+    if not sid:
+        return jsonify({"error": "missing sid"}), 400
+    try:
+        data = load_survey_meta(sid)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 404
+    return jsonify(data)
+
+
+@app.post("/__survey_submit")
+def survey_submit():
+    if request.is_json:
+        payload = request.get_json(force=True) or {}
+        sid = payload.get("sid") or payload.get("survey_id")
+        answers = payload.get("data") or payload.get("answers") or {}
+        participant = payload.get("participant") or {}
+    else:
+        data = request.form.to_dict(flat=False)
+        sid = data.get("sid", [None])[0]
+        answers = {
+            key: (values if len(values) > 1 else values[0])
+            for key, values in data.items()
+            if key.startswith("q_")
+        }
+        participant = {
+            "external_id": (data.get("participant_id", [""])[0] or "").strip(),
+            "display_name": (data.get("participant_name", [""])[0] or "").strip(),
+        }
+
+    try:
+        sid_int = int(sid)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "invalid sid"}), 400
+
+    try:
+        save_survey_submission(sid_int, answers, participant)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    return jsonify({"ok": True})
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8300"))
+    debug_mode = os.getenv("FLASK_DEBUG", "0") in {"1", "true", "True"}
+    app.run(host="0.0.0.0", port=port, debug=debug_mode)
